@@ -14,13 +14,16 @@ Pop!_OS 24.04 with kernel 6.18.
 >   `/etc/modules-load.d/`.
 > - Install a udev rule under `/etc/udev/rules.d/` that relaxes the group
 >   permission on one sysfs `uevent` file.
-> - Install binaries under `/usr/local/bin` and gstreamer plugins under
+> - Install binaries under `/usr/local/bin` (the bridge launcher and a
+>   tray indicator) and gstreamer plugins under
 >   `/usr/lib/x86_64-linux-gnu/gstreamer-1.0/`.
+> - Install a `systemd-suspend` hook under `/usr/lib/systemd/system-sleep/`
+>   that runs as root before every suspend.
 > - Clone and compile Intel's proprietary `ipu6-camera-bins`,
 >   `ipu6-camera-hal`, and `icamerasrc` from GitHub and install the
 >   results into `/usr`.
-> - Install a systemd `--user` unit and two WirePlumber rules under your
->   home directory.
+> - Install a systemd `--user` unit, two WirePlumber rules, and an XDG
+>   autostart entry under your home directory.
 >
 > They have been tested **only** on one machine: a Dell Precision 5490
 > with Pop!_OS 24.04 and kernel 6.18.x. They will likely also work on a
@@ -50,22 +53,22 @@ sudo ./dell-precision-5490-camera-build.sh # camera prereq: builds Intel HAL + i
 sudo ./dell-precision-5490-camera-bridge.sh # camera: raw-Bayer to v4l2loopback bridge
 ```
 
-The bridge is installed but **not** enabled at boot. Start it only when you
-want a webcam, and stop it when you are done:
+The bridge is installed but **not** enabled at boot. Drive it from the
+**tray icon** that autostarts in the COSMIC panel (menu: Start, Stop,
+Status; the icon also reflects ON/OFF state), or from the command line:
 
 ```sh
-systemctl --user start camera-bridge.service   # camera on, LED on, ~30% of a core
+systemctl --user start camera-bridge.service   # camera on, LED on, ~25% of a core
 systemctl --user stop  camera-bridge.service   # camera off, LED off
 ```
 
 Once running, apps see the camera as **"IPU6 Bridge"** (or "IPU6 Bridge
 (V4L2)").
 
-> **Always stop the bridge before closing the lid.** The bridge streams the
-> sensor continuously, which keeps the privacy LED lit and prevents the
-> machine from suspending properly. Leaving it running with the lid closed
-> will pin one CPU core, run the fans, and heat the chassis until thermal
-> throttling kicks in. See "What NOT to do" below.
+A `systemd-suspend` hook ships alongside the bridge and auto-stops it
+before the system suspends, so closing the lid with the camera still
+running is safe. The bridge does not auto-restart on resume; click the
+tray icon (or run the `start` command) when you want the camera back.
 
 ## What works
 
@@ -139,7 +142,7 @@ Two subtle pieces make this work:
 | --- | --- |
 | `dell-precision-5490-audio-fix.{md,sh}` | Switches PipeWire to the HiFi profile on the sof-soundwire card. Self-contained, one-line core. |
 | `dell-precision-5490-camera-build.sh` | Builds Intel `ipu6-camera-bins`, `ipu6-camera-hal`, `icamerasrc` from source and installs under `/usr`. The HAL is dormant (PSYS missing) but `icamerasrc` is needed for the IVSC warm-up trick. Source clones land under `~/src/ipu6-build/`. |
-| `dell-precision-5490-camera-bridge.sh` | Installs `v4l2loopback-dkms`, writes the modprobe config, installs the launcher at `/usr/local/bin/camera-bridge-ipu6`, installs the systemd `--user` unit (disabled by default; opt-in start), two WirePlumber rules (hide raw ISYS endpoints, classify `/dev/video98` as `Video/Source`), and one udev rule that makes `/dev/video98`'s sysfs `uevent` file group-writable so the bridge can nudge wireplumber without restarting it. |
+| `dell-precision-5490-camera-bridge.sh` | Installs `v4l2loopback-dkms`, writes the modprobe config, installs the launcher at `/usr/local/bin/camera-bridge-ipu6`, installs the systemd `--user` unit (disabled by default; opt-in start), two WirePlumber rules (hide raw ISYS endpoints, classify `/dev/video98` as `Video/Source`), one udev rule that makes `/dev/video98`'s sysfs `uevent` file group-writable so the bridge can nudge wireplumber without restarting it, a `systemd-suspend` hook at `/usr/lib/systemd/system-sleep/ipu6-bridge-stop` that auto-stops the bridge before sleep, and a tray indicator at `/usr/local/bin/ipu6-bridge-indicator` with an autostart entry. |
 | `README.md` | This file. |
 
 ## Order of operations (longer form)
@@ -217,8 +220,13 @@ Four failure modes we hit during development. Avoid them.
    chassis heats up until thermal throttling. Worse, on this hardware the
    running bridge has been observed to keep a phantom DisplayPort connector
    alive, which makes `cosmic-comp` refuse to handle the lid switch
-   ("External output connected") and the machine never suspends. Always
-   `systemctl --user stop camera-bridge.service` before closing the lid.
+   ("External output connected") and the machine never suspends. The
+   `systemd-suspend` hook installed by `dell-precision-5490-camera-bridge.sh`
+   handles this automatically: it stops the bridge before suspend. The hook
+   does not run on a hard lid close that bypasses suspend, so if `cosmic-comp`
+   is blocking the lid switch, the bridge will still be running. Belt and
+   braces: also stop the bridge from the tray icon (or `systemctl --user stop
+   camera-bridge.service`) before closing the lid.
 
 2. **Don't hot-edit the running launcher and `sudo dell-precision-5490-camera-bridge.sh` while the bridge is mid-stream.** Repeated v4l2sink restarts wedge IVSC at the MEI layer; only a reboot recovers. To experiment, write a separate `/tmp/test.sh` script and exercise it offline; only redeploy the launcher when the experiment is known good.
 
@@ -236,9 +244,13 @@ sudo ./dell-precision-5490-camera-build.sh --uninstall
 
 The HAL bits live entirely under `/usr/lib` (HAL libs + gstreamer plugin) and
 `/usr/include/libcamhal`. The bridge bits live at
-`/usr/local/bin/camera-bridge-ipu6`, `/etc/modprobe.d/zz-v4l2loopback-ipu6.conf`,
-`/etc/udev/rules.d/70-ipu6-bridge.rules`, the two WirePlumber rule files under
-`~/.config/wireplumber/wireplumber.conf.d/`, and the user systemd unit.
+`/usr/local/bin/camera-bridge-ipu6`, `/usr/local/bin/ipu6-bridge-indicator`,
+`/etc/modprobe.d/zz-v4l2loopback-ipu6.conf`,
+`/etc/udev/rules.d/70-ipu6-bridge.rules`,
+`/usr/lib/systemd/system-sleep/ipu6-bridge-stop`, the two WirePlumber rule
+files under `~/.config/wireplumber/wireplumber.conf.d/`, the
+`~/.config/autostart/ipu6-bridge-indicator.desktop` entry, and the user
+systemd unit.
 
 ## Future work
 

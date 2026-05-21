@@ -13,12 +13,21 @@
 #
 # OPERATING MODEL
 # The bridge is installed but NOT enabled at boot. While running, it streams
-# the sensor continuously, which keeps the camera privacy LED lit and blocks
-# the system from suspending properly when you close the lid. Start it only
-# when you actually want a webcam, and stop it before closing the lid:
+# the sensor continuously, which keeps the camera privacy LED lit and uses
+# about a quarter of a CPU core. Start it when you want a webcam, stop it
+# when you do not:
 #
-#   systemctl --user start camera-bridge.service   # turn camera on for this session
+#   systemctl --user start camera-bridge.service   # turn camera on
 #   systemctl --user stop  camera-bridge.service   # turn it back off
+#
+# Two convenience pieces also get installed:
+#   * A systemd-suspend hook at /usr/lib/systemd/system-sleep/ipu6-bridge-stop
+#     auto-stops the bridge before the system suspends, so closing the lid
+#     with the camera still running is safe (the bridge does not auto-restart
+#     on resume).
+#   * A tray indicator at /usr/local/bin/ipu6-bridge-indicator, autostarted
+#     for the invoking user, shows current ON/OFF state and offers
+#     start/stop/status from a menu.
 #
 # Run as: sudo ./dell-precision-5490-camera-bridge.sh
 # Roll back with: sudo ./dell-precision-5490-camera-bridge.sh --uninstall
@@ -71,10 +80,14 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     rm -f "${INVOKING_HOME}/.config/systemd/user/camera-bridge.service"
     rm -f "${INVOKING_HOME}/.config/wireplumber/wireplumber.conf.d/51-ipu6-isys-disable.conf"
     rm -f "${INVOKING_HOME}/.config/wireplumber/wireplumber.conf.d/52-ipu6-bridge-classify.conf"
+    rm -f "${INVOKING_HOME}/.config/autostart/ipu6-bridge-indicator.desktop"
     rm -f /etc/modprobe.d/zz-v4l2loopback-ipu6.conf
     rm -f /etc/modules-load.d/zz-v4l2loopback-ipu6.conf
     rm -f /etc/udev/rules.d/70-ipu6-bridge.rules
+    rm -f /usr/lib/systemd/system-sleep/ipu6-bridge-stop
     udevadm control --reload-rules 2>/dev/null || true
+    pkill -f /usr/local/bin/ipu6-bridge-indicator 2>/dev/null || true
+    rm -f /usr/local/bin/ipu6-bridge-indicator
     rm -f /usr/local/bin/camera-bridge-ipu6
     modprobe -r v4l2loopback 2>/dev/null || true
     apt-get remove --purge -y v4l2loopback-dkms v4l2loopback-utils 2>/dev/null || true
@@ -314,7 +327,197 @@ sudo -u "${INVOKING_USER}" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${USER_UID}/bus" \
     systemctl --user disable camera-bridge.service 2>/dev/null || true
 
-log "Step 6: verifying ${LOOPBACK_DEV} is wired up."
+# ---------------------------------------------------------------------------
+# Step 6: install systemd-suspend hook so the bridge is auto-stopped before
+# the system suspends. Without this, a user who forgets to stop the bridge
+# and closes the lid keeps the sensor running, pins a core, and may block
+# suspend entirely.
+# ---------------------------------------------------------------------------
+log "Step 6: installing systemd-suspend hook to auto-stop the bridge before sleep."
+SLEEP_HOOK="/usr/lib/systemd/system-sleep/ipu6-bridge-stop"
+install -d "$(dirname "${SLEEP_HOOK}")"
+cat > "${SLEEP_HOOK}" <<'SHEOF'
+#!/bin/sh
+# Auto-stop camera-bridge.service for every logged-in user before suspend.
+# Installed by dell-precision-5490-camera-bridge.sh. Without this hook,
+# leaving the bridge running and closing the lid keeps the sensor powered,
+# pins a CPU core, and can prevent the system from actually suspending.
+# Runs as root from systemd-suspend.service / systemd-hibernate.service.
+
+case "$1" in
+    pre)
+        for uid_dir in /run/user/[0-9]*; do
+            [ -d "${uid_dir}" ] || continue
+            user_name="$(stat -c %U "${uid_dir}" 2>/dev/null)"
+            [ -n "${user_name}" ] && [ "${user_name}" != "root" ] || continue
+            [ -S "${uid_dir}/bus" ] || continue
+            su -s /bin/sh -c "
+                XDG_RUNTIME_DIR=${uid_dir} \
+                DBUS_SESSION_BUS_ADDRESS=unix:path=${uid_dir}/bus \
+                systemctl --user stop camera-bridge.service
+            " "${user_name}" 2>/dev/null || true
+        done
+        ;;
+esac
+SHEOF
+chmod 0755 "${SLEEP_HOOK}"
+
+# ---------------------------------------------------------------------------
+# Step 7: install the tray indicator (Ayatana StatusNotifierItem) and its
+# autostart entry. Click the icon for a menu with Start / Stop / Status.
+# ---------------------------------------------------------------------------
+log "Step 7: installing tray indicator (status + start/stop) and autostart entry."
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 >/dev/null
+
+INDICATOR="/usr/local/bin/ipu6-bridge-indicator"
+cat > "${INDICATOR}" <<'PYEOF'
+#!/usr/bin/env python3
+"""Tray indicator for the IPU6 camera bridge.
+
+Polls camera-bridge.service every 3 seconds, shows a tray icon whose
+appearance reflects ON/OFF state, and offers Start / Stop / Status from
+its menu. Designed for COSMIC (which runs a StatusNotifierWatcher), but
+works in any DE with Ayatana / SNI tray support.
+"""
+
+import subprocess
+import sys
+
+import gi
+gi.require_version("Gtk", "3.0")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+except (ValueError, ImportError):
+    sys.stderr.write(
+        "ERROR: AyatanaAppIndicator3 not available. "
+        "Install gir1.2-ayatanaappindicator3-0.1 and try again.\n"
+    )
+    sys.exit(1)
+
+from gi.repository import Gtk, GLib
+
+SERVICE = "camera-bridge.service"
+ICON_ON = "camera-web"
+ICON_OFF = "camera-disabled-symbolic"
+POLL_INTERVAL_MS = 3000
+
+
+def is_active() -> bool:
+    return subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", SERVICE]
+    ).returncode == 0
+
+
+def show_status(_):
+    result = subprocess.run(
+        ["systemctl", "--user", "status", "--no-pager", "--lines=10", SERVICE],
+        capture_output=True, text=True,
+    )
+    text = result.stdout or "(no output)"
+    dialog = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.INFO,
+        buttons=Gtk.ButtonsType.CLOSE,
+        text="camera-bridge.service",
+    )
+    dialog.format_secondary_text(text)
+    dialog.set_default_size(700, 400)
+    dialog.run()
+    dialog.destroy()
+
+
+def on_start(_):
+    subprocess.run(["systemctl", "--user", "start", SERVICE])
+
+
+def on_stop(_):
+    subprocess.run(["systemctl", "--user", "stop", SERVICE])
+
+
+def on_quit(_):
+    Gtk.main_quit()
+
+
+def main():
+    indicator = AppIndicator3.Indicator.new(
+        "ipu6-bridge-indicator",
+        ICON_OFF,
+        AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+    )
+    indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+    indicator.set_title("IPU6 Camera Bridge")
+
+    menu = Gtk.Menu()
+
+    status_item = Gtk.MenuItem(label="Camera: checking")
+    status_item.connect("activate", show_status)
+    menu.append(status_item)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    start_item = Gtk.MenuItem(label="Start camera")
+    start_item.connect("activate", on_start)
+    menu.append(start_item)
+
+    stop_item = Gtk.MenuItem(label="Stop camera")
+    stop_item.connect("activate", on_stop)
+    menu.append(stop_item)
+
+    menu.append(Gtk.SeparatorMenuItem())
+
+    quit_item = Gtk.MenuItem(label="Quit indicator")
+    quit_item.connect("activate", on_quit)
+    menu.append(quit_item)
+
+    menu.show_all()
+    indicator.set_menu(menu)
+
+    def tick():
+        on = is_active()
+        indicator.set_icon_full(
+            ICON_ON if on else ICON_OFF,
+            "Camera bridge active" if on else "Camera bridge stopped",
+        )
+        indicator.set_label("ON" if on else "", "ipu6")
+        status_item.set_label("Camera: ON" if on else "Camera: OFF")
+        start_item.set_sensitive(not on)
+        stop_item.set_sensitive(on)
+        return True
+
+    tick()
+    GLib.timeout_add(POLL_INTERVAL_MS, tick)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+chmod 0755 "${INDICATOR}"
+
+# Autostart entry for the invoking user.
+AUTOSTART_DIR="${INVOKING_HOME}/.config/autostart"
+install -d -o "${INVOKING_USER}" -g "${INVOKING_USER}" "${AUTOSTART_DIR}"
+cat > "${AUTOSTART_DIR}/ipu6-bridge-indicator.desktop" <<DEEOF
+[Desktop Entry]
+Type=Application
+Name=IPU6 Camera Bridge Indicator
+Comment=Status, start, and stop controls for the IPU6 webcam bridge
+Exec=${INDICATOR}
+Icon=camera-web
+Categories=Utility;
+StartupNotify=false
+Terminal=false
+X-GNOME-Autostart-enabled=true
+DEEOF
+chown "${INVOKING_USER}:${INVOKING_USER}" "${AUTOSTART_DIR}/ipu6-bridge-indicator.desktop"
+
+# Kill any prior indicator instance. The new one will be launched at next
+# login by the autostart entry. For this session, the install message
+# tells the user how to launch it manually.
+pkill -f "${INDICATOR}" 2>/dev/null || true
+
+log "Step 8: verifying ${LOOPBACK_DEV} is wired up."
 log "  ${LOOPBACK_DEV} formats:"
 v4l2-ctl -d "${LOOPBACK_DEV}" --list-formats-ext 2>&1 | sed "s/^/    /" | head -10
 
@@ -322,13 +525,18 @@ cat <<TIPS
 
 ${LOG_PREFIX} Done. Bridge is installed but not running.
 
-Start it when you actually want a webcam:
-  systemctl --user start camera-bridge.service
+To use the tray indicator THIS session, launch it once by hand:
+  ${INDICATOR} &
+Subsequent logins will start it automatically (autostart entry installed).
+The menu offers Start, Stop, and Status. The icon shows ON / OFF at a glance.
 
-Stop it when you're done (and ALWAYS stop it before closing the lid, otherwise
-the sensor keeps running, the privacy LED stays on, and the system won't
-suspend properly):
-  systemctl --user stop camera-bridge.service
+From the command line, equivalently:
+  systemctl --user start camera-bridge.service
+  systemctl --user stop  camera-bridge.service
+
+A systemd-suspend hook auto-stops the bridge before sleep, so closing the
+lid with the camera still running is safe. The bridge does not auto-restart
+on resume; click the tray icon to bring it back next time you need it.
 
 Use the camera by selecting "${LOOPBACK_LABEL}" as the webcam in any app
 (Slack/Zoom/Chrome/Firefox/cheese).
