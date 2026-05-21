@@ -13,8 +13,22 @@ sudo ./dell-precision-5490-camera-build.sh # camera prereq: builds Intel HAL + i
 sudo ./dell-precision-5490-camera-bridge.sh # camera: raw-Bayer to v4l2loopback bridge
 ```
 
-Reboot once after all three. Camera will auto-start. Then in apps, pick
-**"IPU6 Bridge"** (or "IPU6 Bridge (V4L2)") as the webcam.
+The bridge is installed but **not** enabled at boot. Start it only when you
+want a webcam, and stop it when you are done:
+
+```sh
+systemctl --user start camera-bridge.service   # camera on, LED on, ~30% of a core
+systemctl --user stop  camera-bridge.service   # camera off, LED off
+```
+
+Once running, apps see the camera as **"IPU6 Bridge"** (or "IPU6 Bridge
+(V4L2)").
+
+> **Always stop the bridge before closing the lid.** The bridge streams the
+> sensor continuously, which keeps the privacy LED lit and prevents the
+> machine from suspending properly. Leaving it running with the lid closed
+> will pin one CPU core, run the fans, and heat the chassis until thermal
+> throttling kicks in. See "What NOT to do" below.
 
 ## What works
 
@@ -63,13 +77,24 @@ Two subtle pieces make this work:
   `max_buffers=8` because the v4l2sink MMAP bufferpool defaults to 2 and that
   is too few. Without these, Slack refuses to enumerate the device.
 
+- **PipeWire misclassifies the loopback as a sink until the writer attaches.**
+  When wireplumber first sees `/dev/video98` (no writer yet), it reads the
+  caps as `:video_output:` and creates no source node. To fix that without
+  restarting wireplumber (which would drop every audio stream), we ship two
+  small rules. A WirePlumber rule forces `/dev/video98` to
+  `media.class = Video/Source`. A udev rule makes the sysfs `uevent` file
+  group-writable for the `video` group. The bridge unit's `ExecStartPost`
+  writes `change` to that file once the writer is producing frames, which
+  causes wireplumber to re-evaluate just this one device against the rule.
+  No audio interruption, no whole-daemon restart.
+
 ## File map
 
 | File | Purpose |
 | --- | --- |
 | `dell-precision-5490-audio-fix.{md,sh}` | Switches PipeWire to the HiFi profile on the sof-soundwire card. Self-contained, one-line core. |
 | `dell-precision-5490-camera-build.sh` | Builds Intel `ipu6-camera-bins`, `ipu6-camera-hal`, `icamerasrc` from source and installs under `/usr`. The HAL is dormant (PSYS missing) but `icamerasrc` is needed for the IVSC warm-up trick. Source clones land under `~/src/ipu6-build/`. |
-| `dell-precision-5490-camera-bridge.sh` | Installs `v4l2loopback-dkms`, writes the modprobe config, installs the launcher at `/usr/local/bin/camera-bridge-ipu6`, installs a systemd `--user` unit, writes a WirePlumber rule to hide ISYS endpoints, and starts everything. |
+| `dell-precision-5490-camera-bridge.sh` | Installs `v4l2loopback-dkms`, writes the modprobe config, installs the launcher at `/usr/local/bin/camera-bridge-ipu6`, installs the systemd `--user` unit (disabled by default; opt-in start), two WirePlumber rules (hide raw ISYS endpoints, classify `/dev/video98` as `Video/Source`), and one udev rule that makes `/dev/video98`'s sysfs `uevent` file group-writable so the bridge can nudge wireplumber without restarting it. |
 | `README.md` | This file. |
 
 ## Order of operations (longer form)
@@ -98,12 +123,24 @@ Two subtle pieces make this work:
      1280x720 (standard 16:9 size; not the native 1280x798 because PipeWire's
      spa.v4l2 won't negotiate non-standard sizes for cheese et al).
    - `v4l2sink io-mode=mmap` to `/dev/video98`.
-   Also installs a WirePlumber rule
-   (`~/.config/wireplumber/wireplumber.conf.d/51-ipu6-isys-disable.conf`)
-   that hides the dozens of raw ISYS endpoints from PipeWire's camera list.
-   The systemd `--user` unit's `ExecStartPost` restarts wireplumber so the
-   `/dev/video98` device gets classified as `Video/Source` after the writer
-   attaches.
+   Also installs:
+   - A WirePlumber rule
+     (`~/.config/wireplumber/wireplumber.conf.d/51-ipu6-isys-disable.conf`)
+     that hides the dozens of raw ISYS endpoints from PipeWire's camera list.
+   - A second WirePlumber rule
+     (`~/.config/wireplumber/wireplumber.conf.d/52-ipu6-bridge-classify.conf`)
+     that forces `/dev/video98` to `media.class = Video/Source`.
+   - A udev rule (`/etc/udev/rules.d/70-ipu6-bridge.rules`) that makes
+     `/sys/class/video4linux/video98/uevent` group-writable for the `video`
+     group.
+   The systemd `--user` unit's `ExecStartPost` writes `change` into that
+   uevent file once the writer is producing frames. That generates a fresh
+   udev event, wireplumber's v4l2 monitor re-evaluates `/dev/video98`
+   against the classify rule, and a source node appears. No wireplumber
+   restart, so audio streams are not interrupted.
+
+   The unit is installed but **not** enabled. Start it per session:
+   `systemctl --user start camera-bridge.service`.
 
 ## App-side configuration
 
@@ -127,13 +164,22 @@ Re-run `sudo dell-precision-5490-camera-bridge.sh` to apply edits.
 
 ## What NOT to do
 
-Three failure modes we hit during development. Avoid them.
+Four failure modes we hit during development. Avoid them.
 
-1. **Don't hot-edit the running launcher and `sudo dell-precision-5490-camera-bridge.sh` while the bridge is mid-stream.** Repeated v4l2sink restarts wedge IVSC at the MEI layer; only a reboot recovers. To experiment, write a separate `/tmp/test.sh` script and exercise it offline; only redeploy the launcher when the experiment is known good.
+1. **Don't leave the bridge running with the lid closed.** The bridge streams
+   the sensor 24/7 while active, which keeps the privacy LED lit and pins one
+   CPU core continuously. With the lid closed there is no airflow, so the
+   chassis heats up until thermal throttling. Worse, on this hardware the
+   running bridge has been observed to keep a phantom DisplayPort connector
+   alive, which makes `cosmic-comp` refuse to handle the lid switch
+   ("External output connected") and the machine never suspends. Always
+   `systemctl --user stop camera-bridge.service` before closing the lid.
 
-2. **Don't try to "fix the green tint" with a `glshader` patch on the live pipeline.** That's specifically what wedged us. The proper green-tint fix is to write a small Python `numpy + opencv` shim that reads raw Bayer, applies a real AWB matrix, debayers, and writes to v4l2loopback. Develop it standalone, replace the gst-launch stage when it's working.
+2. **Don't hot-edit the running launcher and `sudo dell-precision-5490-camera-bridge.sh` while the bridge is mid-stream.** Repeated v4l2sink restarts wedge IVSC at the MEI layer; only a reboot recovers. To experiment, write a separate `/tmp/test.sh` script and exercise it offline; only redeploy the launcher when the experiment is known good.
 
-3. **Don't enable `exclusive_caps=0` on v4l2loopback.** v4l2-ctl readers like it, but Chromium-based apps (Slack, Chrome, Electron) refuse to enumerate v4l2 devices that expose both Output and Capture caps. Keep it at 1.
+3. **Don't try to "fix the green tint" with a `glshader` patch on the live pipeline.** That's specifically what wedged us. The proper green-tint fix is to write a small Python `numpy + opencv` shim that reads raw Bayer, applies a real AWB matrix, debayers, and writes to v4l2loopback. Develop it standalone, replace the gst-launch stage when it's working.
+
+4. **Don't enable `exclusive_caps=0` on v4l2loopback.** v4l2-ctl readers like it, but Chromium-based apps (Slack, Chrome, Electron) refuse to enumerate v4l2 devices that expose both Output and Capture caps. Keep it at 1.
 
 ## Rolling back
 
@@ -144,8 +190,10 @@ sudo ./dell-precision-5490-camera-build.sh --uninstall
 ```
 
 The HAL bits live entirely under `/usr/lib` (HAL libs + gstreamer plugin) and
-`/usr/include/libcamhal`. The bridge bits live at `/usr/local/bin/camera-bridge-ipu6`,
-`/etc/modprobe.d/zz-v4l2loopback-ipu6.conf`, and the user systemd unit.
+`/usr/include/libcamhal`. The bridge bits live at
+`/usr/local/bin/camera-bridge-ipu6`, `/etc/modprobe.d/zz-v4l2loopback-ipu6.conf`,
+`/etc/udev/rules.d/70-ipu6-bridge.rules`, the two WirePlumber rule files under
+`~/.config/wireplumber/wireplumber.conf.d/`, and the user systemd unit.
 
 ## Future work
 

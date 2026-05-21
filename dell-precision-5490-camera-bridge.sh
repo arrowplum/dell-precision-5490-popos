@@ -11,6 +11,15 @@
 #   typical indoor desk lighting. Tweak the SENSOR_* vars below if needed.
 # * Frame rate is capped by sensor exposure; default settings give ~30-60 fps.
 #
+# OPERATING MODEL
+# The bridge is installed but NOT enabled at boot. While running, it streams
+# the sensor continuously, which keeps the camera privacy LED lit and blocks
+# the system from suspending properly when you close the lid. Start it only
+# when you actually want a webcam, and stop it before closing the lid:
+#
+#   systemctl --user start camera-bridge.service   # turn camera on for this session
+#   systemctl --user stop  camera-bridge.service   # turn it back off
+#
 # Run as: sudo ./dell-precision-5490-camera-bridge.sh
 # Roll back with: sudo ./dell-precision-5490-camera-bridge.sh --uninstall
 
@@ -61,8 +70,11 @@ if [[ "${1:-}" == "--uninstall" ]]; then
         systemctl --user disable --now camera-bridge.service 2>/dev/null || true
     rm -f "${INVOKING_HOME}/.config/systemd/user/camera-bridge.service"
     rm -f "${INVOKING_HOME}/.config/wireplumber/wireplumber.conf.d/51-ipu6-isys-disable.conf"
+    rm -f "${INVOKING_HOME}/.config/wireplumber/wireplumber.conf.d/52-ipu6-bridge-classify.conf"
     rm -f /etc/modprobe.d/zz-v4l2loopback-ipu6.conf
     rm -f /etc/modules-load.d/zz-v4l2loopback-ipu6.conf
+    rm -f /etc/udev/rules.d/70-ipu6-bridge.rules
+    udevadm control --reload-rules 2>/dev/null || true
     rm -f /usr/local/bin/camera-bridge-ipu6
     modprobe -r v4l2loopback 2>/dev/null || true
     apt-get remove --purge -y v4l2loopback-dkms v4l2loopback-utils 2>/dev/null || true
@@ -133,6 +145,48 @@ monitor.v4l2.rules = [
 ]
 WPEOF
 chown "${INVOKING_USER}:${INVOKING_USER}" "${WP_DIR}/51-ipu6-isys-disable.conf"
+
+# WirePlumber rule: force /dev/video98 to be classified as a Video/Source.
+# Without this rule, wireplumber reads the loopback's initial v4l2 caps as
+# ":video_output:" (before any writer attaches) and refuses to create a
+# source node, so PipeWire-using apps can't see the camera. Combined with
+# the udev rule below, this lets the bridge launcher nudge wireplumber to
+# re-evaluate the device without restarting wireplumber (which would drop
+# every audio stream as a side effect).
+log "  installing WirePlumber rule to classify ${LOOPBACK_DEV} as Video/Source."
+cat > "${WP_DIR}/52-ipu6-bridge-classify.conf" <<WPEOF
+monitor.v4l2.rules = [
+  {
+    matches = [
+      { api.v4l2.path = "${LOOPBACK_DEV}" }
+    ]
+    actions = {
+      update-props = {
+        device.capabilities = ":video_capture:"
+        media.class = "Video/Source"
+      }
+    }
+  }
+]
+WPEOF
+chown "${INVOKING_USER}:${INVOKING_USER}" "${WP_DIR}/52-ipu6-bridge-classify.conf"
+
+# udev rule: make the sysfs uevent file for ${LOOPBACK_DEV} writable by the
+# "video" group. With this in place, the user-level bridge service can write
+# "change" into that file and trigger wireplumber to re-evaluate the loopback
+# (which is how we get a Video/Source node without restarting wireplumber).
+log "  installing udev rule to make ${LOOPBACK_DEV}'s uevent file group-writable."
+cat > /etc/udev/rules.d/70-ipu6-bridge.rules <<UDEOF
+# Make /sys/.../${LOOPBACK_DEV##/dev/}/uevent writable by the "video" group so the
+# camera bridge user service can nudge wireplumber to re-evaluate the loopback
+# without restarting wireplumber. The uevent file is already owned root:video;
+# we just need +w on group.
+SUBSYSTEM=="video4linux", KERNEL=="${LOOPBACK_DEV##/dev/}", ACTION=="add|change", RUN+="/bin/chmod g+w /sys%p/uevent"
+UDEOF
+udevadm control --reload-rules
+# Apply to the device that's already present so a reboot isn't required.
+[[ -e "/sys/class/video4linux/${LOOPBACK_DEV##/dev/}/uevent" ]] && \
+    chmod g+w "/sys/class/video4linux/${LOOPBACK_DEV##/dev/}/uevent" || true
 
 log "  reloading v4l2loopback (stops bridge service first so the module isn't held)."
 sudo -u "${INVOKING_USER}" \
@@ -215,11 +269,14 @@ Wants=wireplumber.service
 [Service]
 Type=simple
 ExecStart=${LAUNCHER}
-# After the writer is producing frames, restart wireplumber so it re-enumerates
-# /dev/video98 and tags it as Video/Source (Camera). Without this, PipeWire
-# saw v4l2loopback before the writer attached and classified it as
-# Video Output only, hiding it from Firefox / PipeWire-using apps.
-ExecStartPost=/bin/sh -c 'sleep 3; systemctl --user restart wireplumber'
+# Nudge wireplumber to re-evaluate ${LOOPBACK_DEV} against the classify rule
+# in wireplumber.conf.d/52-ipu6-bridge-classify.conf, which tags it as
+# Video/Source. Writing "change" to the device's sysfs uevent file generates
+# a fresh udev event that wireplumber's v4l2 monitor picks up, without
+# restarting wireplumber (which would drop every audio stream).
+# The sysfs uevent file is made group-writable for the "video" group by the
+# udev rule at /etc/udev/rules.d/70-ipu6-bridge.rules.
+ExecStartPost=/bin/sh -c 'sleep 3; echo change > /sys/class/video4linux/${LOOPBACK_DEV##/dev/}/uevent 2>/dev/null || true'
 Restart=on-failure
 RestartSec=2s
 # Keep one frame's worth of margin; ISYS streaming is throughput-sensitive.
@@ -227,38 +284,47 @@ Nice=-5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=0
 
-[Install]
-WantedBy=default.target
+# No [Install] section on purpose. The bridge is opt-in per session: it
+# streams the sensor continuously, which keeps the privacy LED lit and
+# blocks suspend-on-lid-close. Start it manually when you want a webcam:
+#   systemctl --user start camera-bridge.service
+# Stop it when you're done, and before closing the lid:
+#   systemctl --user stop  camera-bridge.service
 EOF
 chown "${INVOKING_USER}:${INVOKING_USER}" "${USER_UNIT_DIR}/camera-bridge.service"
 
 # ---------------------------------------------------------------------------
-# Step 5: enable + start the user service.
+# Step 5: register the unit (daemon-reload). Do NOT enable or start it.
+# The bridge is opt-in per session; auto-start at boot keeps the LED on and
+# blocks lid-close suspend.
 # ---------------------------------------------------------------------------
-log "Step 5: starting the bridge service as ${INVOKING_USER}."
+log "Step 5: registering the user unit (no auto-start)."
 sudo -u "${INVOKING_USER}" \
     XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${USER_UID}/bus" \
     systemctl --user daemon-reload
+# If a previous run of this script enabled the unit, disable it now so the
+# bridge doesn't auto-start at next login.
 sudo -u "${INVOKING_USER}" \
     XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${USER_UID}/bus" \
-    systemctl --user enable --now camera-bridge.service
+    systemctl --user disable camera-bridge.service 2>/dev/null || true
 
-sleep 3
-log "Step 6: verifying."
-log "  Service status:"
-sudo -u "${INVOKING_USER}" \
-    XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
-    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${USER_UID}/bus" \
-    systemctl --user --no-pager status camera-bridge.service 2>&1 | sed "s/^/    /" | head -20
-
+log "Step 6: verifying ${LOOPBACK_DEV} is wired up."
 log "  ${LOOPBACK_DEV} formats:"
 v4l2-ctl -d "${LOOPBACK_DEV}" --list-formats-ext 2>&1 | sed "s/^/    /" | head -10
 
 cat <<TIPS
 
-${LOG_PREFIX} Done.
+${LOG_PREFIX} Done. Bridge is installed but not running.
+
+Start it when you actually want a webcam:
+  systemctl --user start camera-bridge.service
+
+Stop it when you're done (and ALWAYS stop it before closing the lid, otherwise
+the sensor keeps running, the privacy LED stays on, and the system won't
+suspend properly):
+  systemctl --user stop camera-bridge.service
 
 Use the camera by selecting "${LOOPBACK_LABEL}" as the webcam in any app
 (Slack/Zoom/Chrome/Firefox/cheese).
@@ -266,9 +332,8 @@ Use the camera by selecting "${LOOPBACK_LABEL}" as the webcam in any app
 To preview locally:
   gst-launch-1.0 v4l2src device=${LOOPBACK_DEV} ! videoconvert ! autovideosink
 
-To stop or troubleshoot:
+Troubleshooting:
   systemctl --user status camera-bridge.service
-  systemctl --user stop camera-bridge.service
   journalctl --user -u camera-bridge.service -f
 
 Tunable image settings live in the env vars near the top of this script.
