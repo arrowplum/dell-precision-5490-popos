@@ -269,14 +269,18 @@ Wants=wireplumber.service
 [Service]
 Type=simple
 ExecStart=${LAUNCHER}
-# Nudge wireplumber to re-evaluate ${LOOPBACK_DEV} against the classify rule
-# in wireplumber.conf.d/52-ipu6-bridge-classify.conf, which tags it as
-# Video/Source. Writing "change" to the device's sysfs uevent file generates
-# a fresh udev event that wireplumber's v4l2 monitor picks up, without
-# restarting wireplumber (which would drop every audio stream).
-# The sysfs uevent file is made group-writable for the "video" group by the
-# udev rule at /etc/udev/rules.d/70-ipu6-bridge.rules.
-ExecStartPost=/bin/sh -c 'sleep 3; echo change > /sys/class/video4linux/${LOOPBACK_DEV##/dev/}/uevent 2>/dev/null || true'
+# Force wireplumber to rebuild the ${LOOPBACK_DEV} device proxy with its
+# child Source node. Sending a "change" event only updates properties;
+# wireplumber's v4l2 monitor does not re-evaluate child node creation on
+# change. A fake "remove" + "add" cycle on the sysfs uevent file makes it
+# destroy and recreate the device, which DOES create the Source node from
+# current caps (Video Capture + YUYV 1280x720) and pick up the classify
+# rule in wireplumber.conf.d/52-ipu6-bridge-classify.conf.
+# The underlying v4l2loopback kernel device is unaffected: the writer's
+# open fd keeps it alive; the uevent file just emits userspace events.
+# The sysfs uevent file is made group-writable for the "video" group by
+# /etc/udev/rules.d/70-ipu6-bridge.rules. Audio streams are untouched.
+ExecStartPost=/bin/sh -c 'sleep 3; { echo remove > /sys/class/video4linux/${LOOPBACK_DEV##/dev/}/uevent; sleep 1; echo add > /sys/class/video4linux/${LOOPBACK_DEV##/dev/}/uevent; } 2>/dev/null || true'
 Restart=on-failure
 RestartSec=2s
 # Keep one frame's worth of margin; ISYS streaming is throughput-sensitive.

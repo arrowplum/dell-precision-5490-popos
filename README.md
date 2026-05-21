@@ -77,16 +77,24 @@ Two subtle pieces make this work:
   `max_buffers=8` because the v4l2sink MMAP bufferpool defaults to 2 and that
   is too few. Without these, Slack refuses to enumerate the device.
 
-- **PipeWire misclassifies the loopback as a sink until the writer attaches.**
-  When wireplumber first sees `/dev/video98` (no writer yet), it reads the
-  caps as `:video_output:` and creates no source node. To fix that without
-  restarting wireplumber (which would drop every audio stream), we ship two
-  small rules. A WirePlumber rule forces `/dev/video98` to
-  `media.class = Video/Source`. A udev rule makes the sysfs `uevent` file
+- **PipeWire never creates a Source node for the loopback until the writer
+  has attached and wireplumber rebuilds the device proxy.** When
+  wireplumber first sees `/dev/video98` (no writer yet), it reads the caps
+  as `:video_output:` and skips Source-node creation. Sending a `change`
+  udev event later updates properties but does NOT make the v4l2 monitor
+  re-evaluate child node creation. The full rebuild only happens on a
+  fresh add. To get that without restarting wireplumber (which would drop
+  every audio stream), we ship three pieces. A WirePlumber rule classifies
+  `/dev/video98` (`media.class = Video/Source`, `device.capabilities =
+  :video_capture:`). A udev rule makes the sysfs `uevent` file
   group-writable for the `video` group. The bridge unit's `ExecStartPost`
-  writes `change` to that file once the writer is producing frames, which
-  causes wireplumber to re-evaluate just this one device against the rule.
-  No audio interruption, no whole-daemon restart.
+  then issues a fake `remove` + `add` cycle on that uevent file once the
+  writer is producing frames. Wireplumber sees REMOVE, destroys the device
+  proxy; sees ADD, recreates it; reads current caps (Video Capture, YUYV
+  1280x720), applies the classify rule, and creates the Source node. The
+  underlying v4l2loopback kernel device is unaffected because the writer's
+  open fd holds it alive; the uevent file only emits userspace events.
+  Audio is untouched.
 
 ## File map
 
@@ -133,11 +141,11 @@ Two subtle pieces make this work:
    - A udev rule (`/etc/udev/rules.d/70-ipu6-bridge.rules`) that makes
      `/sys/class/video4linux/video98/uevent` group-writable for the `video`
      group.
-   The systemd `--user` unit's `ExecStartPost` writes `change` into that
-   uevent file once the writer is producing frames. That generates a fresh
-   udev event, wireplumber's v4l2 monitor re-evaluates `/dev/video98`
-   against the classify rule, and a source node appears. No wireplumber
-   restart, so audio streams are not interrupted.
+   The systemd `--user` unit's `ExecStartPost` writes `remove` then `add`
+   into that uevent file once the writer is producing frames. Wireplumber's
+   v4l2 monitor destroys and recreates the `/dev/video98` device proxy and
+   creates a `Video/Source` child node from the current caps. No
+   wireplumber restart, so audio streams are not interrupted.
 
    The unit is installed but **not** enabled. Start it per session:
    `systemctl --user start camera-bridge.service`.
