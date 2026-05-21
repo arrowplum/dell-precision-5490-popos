@@ -5,6 +5,43 @@ function on a Dell Precision 5490 (and likely close cousins such as Latitude
 7340/7440/7640 with the same Meteor Lake + OV01A10 + IVSC config) running
 Pop!_OS 24.04 with kernel 6.18.
 
+> ## ⚠️ Read this before running anything
+>
+> These scripts run **as root** and make system-level changes:
+>
+> - Install kernel modules via DKMS (`v4l2loopback-dkms`).
+> - Write modprobe and modules-load configs under `/etc/modprobe.d/` and
+>   `/etc/modules-load.d/`.
+> - Install a udev rule under `/etc/udev/rules.d/` that relaxes the group
+>   permission on one sysfs `uevent` file.
+> - Install binaries under `/usr/local/bin` and gstreamer plugins under
+>   `/usr/lib/x86_64-linux-gnu/gstreamer-1.0/`.
+> - Clone and compile Intel's proprietary `ipu6-camera-bins`,
+>   `ipu6-camera-hal`, and `icamerasrc` from GitHub and install the
+>   results into `/usr`.
+> - Install a systemd `--user` unit and two WirePlumber rules under your
+>   home directory.
+>
+> They have been tested **only** on one machine: a Dell Precision 5490
+> with Pop!_OS 24.04 and kernel 6.18.x. They will likely also work on a
+> Latitude 7340/7440/7640 with the same Meteor Lake + OV01A10 + IVSC
+> hardware, but that has not been verified. On any other hardware they
+> may do nothing useful or may leave the system in a state that needs
+> manual recovery.
+>
+> **No warranty. No indemnity.** This software is provided under the
+> [Apache License 2.0](LICENSE), which explicitly disclaims all warranties
+> and limits the contributors' liability. In plain terms: you accept all
+> risk of using these scripts. The authors and contributors will not be
+> liable for any damage to your hardware, loss of data, downtime, or any
+> other consequence of running them. If you are not comfortable reading
+> the scripts before executing them, do not execute them.
+>
+> Reporting security issues, contributing fixes, and community
+> expectations are covered in [SECURITY.md](SECURITY.md),
+> [CONTRIBUTING.md](CONTRIBUTING.md), and
+> [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## TL;DR install order
 
 ```sh
@@ -215,3 +252,18 @@ The HAL bits live entirely under `/usr/lib` (HAL libs + gstreamer plugin) and
 - **AWB / green-tint fix**: write a Python shim that does proper white balance
   on the raw Bayer. Develop standalone, swap into the launcher pipeline only
   after standalone tests pass. See "What NOT to do" #2.
+
+## License
+
+This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE)
+for the full text. The license explicitly disclaims all warranties and
+limits liability. By using these scripts you accept all risk; see the
+warning at the top of this file.
+
+## Related documents
+
+- [LICENSE](LICENSE) ([Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0))
+- [SECURITY.md](SECURITY.md): how to privately report a vulnerability and
+  what is in / out of scope for this repo.
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to file bugs and submit patches.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): Contributor Covenant 3.0.
