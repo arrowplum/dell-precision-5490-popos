@@ -60,9 +60,9 @@ OUT_WIDTH=1280                      # What we expose to v4l2loopback consumers
 OUT_HEIGHT=720                      # Standard 16:9 height; PipeWire/cheese rejects non-standard
 BAYER_FORMAT="grbg10le"             # GStreamer caps; matches v4l2 BA10
 FRAMERATE=30                        # target output fps
-SENSOR_EXPOSURE=500                 # in sensor lines; max=888 at default vblank
+SENSOR_EXPOSURE=800                 # in sensor lines; max=888 at default vblank
 SENSOR_GAIN=8192                    # analogue gain, default 256 (=1.0x), max 65535
-SENSOR_DIGITAL_GAIN=4096            # default 1024 (=1.0x), max 262143
+SENSOR_DIGITAL_GAIN=8192            # default 1024 (=1.0x), max 262143
 SENSOR_VBLANK=96                    # default 96; larger = lower fps + longer exposure budget
 
 FRAME_BYTES=$(( WIDTH * HEIGHT * 2 ))
