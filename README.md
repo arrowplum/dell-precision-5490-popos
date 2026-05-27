@@ -48,9 +48,14 @@ Pop!_OS 24.04 with kernel 6.18.
 ## TL;DR install order
 
 ```sh
-sudo ./dell-precision-5490-audio-fix.sh    # audio: a 1-liner profile switch
-sudo ./dell-precision-5490-camera-build.sh # camera prereq: builds Intel HAL + icamerasrc
-sudo ./dell-precision-5490-camera-bridge.sh # camera: raw-Bayer to v4l2loopback bridge
+# Audio runs as your normal user: it only switches your PipeWire session
+# profile, so do NOT use sudo (under sudo, pactl talks to root's session and
+# the script can't find the card).
+./dell-precision-5490-audio-fix.sh           # audio: a 1-liner profile switch
+
+# Camera steps install system files and DO need root:
+sudo ./dell-precision-5490-camera-build.sh   # camera prereq: builds Intel HAL + icamerasrc
+sudo ./dell-precision-5490-camera-bridge.sh  # camera: raw Bayer to v4l2loopback bridge
 ```
 
 The bridge is installed but **not** enabled at boot. Drive it from the
@@ -84,9 +89,62 @@ tray icon (or run the `start` command) when you want the camera back.
 | Firefox (PipeWire camera mode) | ✅ | clean single-entry dropdown (recommended; see Firefox notes) |
 
 Image quality is intentionally limited: no auto-exposure, no auto-white-balance,
-no denoising, no lens shading correction. Picture is dim and noticeably
-green-tinted. This is unavoidable without the Intel PSYS userspace stack, which
-won't build against kernel 6.18 as of May 2026.
+no denoising, no lens shading correction. Picture is noticeably green-tinted,
+and with no auto-exposure it can look dim in low light; raise the gain values
+under [Tuning](#tuning). This is unavoidable without the Intel PSYS userspace
+stack, which won't build against kernel 6.18 as of May 2026.
+
+## Background: what is a "raw Bayer bridge"?
+
+If you already know what raw Bayer is and why debayering matters, skip to
+[Why the camera is non-trivial](#why-the-camera-is-non-trivial-on-this-hardware).
+
+A camera sensor does not capture color directly. Each pixel sits under a single
+colored filter arranged in a repeating 2x2 pattern called a **Bayer mosaic**
+(twice as many green cells as red or blue, because the eye is most sensitive to
+green):
+
+```
+G R G R
+B G B G
+G R G R
+B G B G
+```
+
+So every pixel records only one channel. The raw sensor dump is this
+single-channel mosaic: **raw Bayer**. It is not a viewable image yet. Turning it
+into normal RGB requires **debayering** (also called demosaicing): interpolating
+the two missing channels at each pixel from its neighbors, plus white balance,
+exposure, and noise correction. On this laptop a dedicated hardware block (the
+Intel IPU6 **PSYS**) would normally do all of that. PSYS does not work on kernel
+6.18, which is the whole problem this repo works around.
+
+Apps like Slack and Chrome cannot consume raw Bayer; they expect a finished
+camera at a `/dev/videoN` node. The **bridge** is a small pipeline that fills
+that gap by doing the work in software on the CPU:
+
+```
+sensor (kernel ISYS)   ->  raw Bayer frames at /dev/video32
+        |
+   v4l2-ctl            ->  reads the raw frames out
+        |
+   GStreamer bayer2rgb ->  software debayer (stands in for the broken PSYS)
+        |
+   v4l2loopback        ->  writes finished YUV frames to a *virtual* camera
+                           device /dev/video98 ("IPU6 Bridge")
+        |
+   Slack / Chrome      ->  open /dev/video98 and see a normal webcam
+```
+
+Two pieces carry the trick. **v4l2loopback** is a kernel module that creates a
+virtual camera node with nothing physically behind it; whatever you write into
+it, any app reading it sees as a webcam feed. **GStreamer's `bayer2rgb`** does
+the debayering on the CPU, standing in for the hardware PSYS block.
+
+The cost of doing this in software without PSYS: no auto white balance, so the
+picture is green-tinted (green is the most-sampled channel), and one CPU core
+stays busy while the camera is on. The mechanics of *why* this is fiddly on this
+specific hardware are in the next section.
 
 ## Why the camera is non-trivial on this hardware
 
@@ -155,7 +213,7 @@ Two subtle pieces make this work:
 2. **Camera build.** Clones three Intel repos, copies bin/include files into
    `/usr`, builds `ipu6-camera-hal` and `icamerasrc` against them. Installs
    `gst-launch-1.0 icamerasrc` to `/usr/local/bin` and `/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgsticamerasrc.so`.
-   Takes 5–15 minutes; the HAL is the long step. The HAL is parked: it will
+   Takes 5 to 15 minutes; the HAL is the long step. The HAL is parked: it will
    crash at runtime trying to open PSYS. We only need its enumeration side effects.
 
 3. **Camera bridge.** Installs `v4l2loopback-dkms` (builds against the running
@@ -201,9 +259,9 @@ Two subtle pieces make this work:
 
 Edit the variables near the top of `dell-precision-5490-camera-bridge.sh`:
 
-- `SENSOR_EXPOSURE` (default 500, max 888): higher = brighter, lower = faster shutter.
+- `SENSOR_EXPOSURE` (default 800, max 888): higher = brighter, lower = faster shutter.
 - `SENSOR_GAIN` (default 8192): analog gain. Default 256 = 1.0x. Boost in dim rooms.
-- `SENSOR_DIGITAL_GAIN` (default 4096, default-1024).
+- `SENSOR_DIGITAL_GAIN` (default 8192): default 1024 = 1.0x. Boost to counter dim lighting.
 - `SENSOR_VBLANK` (default 96): increase to allow longer exposure (at cost of fps).
 - `OUT_WIDTH` / `OUT_HEIGHT` (1280 / 720). Standard 16:9 output. Don't change
   unless you understand the videocrop math.
@@ -257,13 +315,13 @@ systemd unit.
 - **When kernel 6.13+-compatible IPU6 PSYS lands** (either upstream mainline or
   a sed-fixed `intel/ipu6-drivers` build), the proper path is to install PSYS,
   let `icamerasrc` succeed instead of crash, and either keep the bridge (with
-  `icamerasrc` upstream of bayer2rgb + AWB instead of our raw-Bayer path) or
+  `icamerasrc` upstream of bayer2rgb + AWB instead of our raw Bayer path) or
   let Pop's built-in `v4l2-relayd@default.service` take over (it already uses
   `VIDEOSRC=icamerasrc`, currently failing for the same reason).
 
 - **AWB / green-tint fix**: write a Python shim that does proper white balance
   on the raw Bayer. Develop standalone, swap into the launcher pipeline only
-  after standalone tests pass. See "What NOT to do" #2.
+  after standalone tests pass. See "What NOT to do" #3.
 
 ## License
 
